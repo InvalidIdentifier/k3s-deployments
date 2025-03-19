@@ -1,0 +1,77 @@
+workflow:
+  name: 'k3s-deployments'
+
+stages:
+  # - plan
+  - deploy
+  - send_notification
+
+variables:
+  TF_ACTION:
+    value: "apply"
+    options:
+      - "plan"
+      - "apply"
+    description: "Define Terraform Action"
+
+before_script:
+  - |
+    # create kube config 
+    mkdir -p ~/.kube
+
+    eval $(ssh-agent -s)
+
+    cp "$KUBE_CONFIG" ~/.kube/config && chmod 400 ~/.kube/config
+
+deploy:
+  stage: deploy
+  image: registry.${DOMAIN}/glrunner:tf
+  script:
+    - |
+      set -e
+
+      TIMESTAMP=$(date +"%Y-%m-%d-%H-%M-%S")
+
+      # create temp dir for state and mount && mount share
+      mkdir -p /tmp/mount /tmp/state
+      mount -t cifs -o username=$TF_STATE_MOUNT_USER,password=$TF_STATE_MOUNT_PW //${GITLAB_HOST}/tfbasestate /tmp/mount
+      mkdir -p /tmp/mount/gueststate_snapshots
+
+      # move state from mount to temp dir
+      cp /tmp/mount/k3s_deployment_state.tfstate /tmp/state/k3s_deployment_state.tfstate 2>/dev/null || :
+
+      if [[ $TF_ACTION != "plan" ]];then
+        TF_OPTIONS="--auto-approve"
+      fi
+
+      # export variables for use in terraform
+      export KUBE_CONFIG_PATH=$KUBE_CONFIG
+      export TF_VAR_domain=$DOMAIN
+      
+      # do terraform stuff
+      terraform -chdir=terraform init || FAILED="1"
+      terraform -chdir=terraform $TF_ACTION $TF_OPTIONS || FAILED="1"
+
+      # backup tfstate
+      cp /tmp/state/k3s_deployment_state.tfstate /tmp/mount/gueststate_snapshots/k3s_deployment_state.tfstate-${TIMESTAMP}_${CI_JOB_ID}_${CI_COMMIT_SHORT_SHA}
+
+      # move state back to share
+      cp /tmp/state/k3s_deployment_state.tfstate /tmp/mount/k3s_deployment_state.tfstate 2>/dev/null || :
+
+      if [[ "$FAILED" -eq "1" ]];then
+        echo "PIPELINE FAILED!"
+        exit 1
+      fi
+
+      # delete >30 days old tfstate backups
+      find /tmp/mount/gueststate_snapshots -name "k3s_deployment_state.tfstate-*" -mtime +30 -exec rm {} \;
+
+send_notification:
+  stage: send_notification
+  image: registry.${DOMAIN}/glrunner:base
+  script:
+    - |
+      ####  send notifications ####
+      curl -H "X-Tags: robot" -u :$NTFY_TOKEN -d "Pipeline - $CI_PIPELINE_NAME - was successfull" https://notify.${DOMAIN}/pipelines
+  needs: 
+    - deploy
