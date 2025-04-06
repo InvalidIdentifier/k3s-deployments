@@ -2,7 +2,6 @@ workflow:
   name: 'k3s-deployments'
 
 stages:
-  # - plan
   - deploy
   - send_notification
 
